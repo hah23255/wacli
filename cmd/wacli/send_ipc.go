@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	sendDelegateVersion    = 1
-	sendDelegateSocketName = ".send.sock"
+	sendDelegateVersion       = 1
+	sendDelegateSocketName    = ".send.sock"
+	sendDelegateResponseGrace = 5 * time.Second
 )
 
 var errSendDelegateUnavailable = errors.New("send delegate unavailable")
@@ -58,6 +59,7 @@ type sendDelegateRequest struct {
 	PresenceMedia        string   `json:"presence_media,omitempty"`
 	PostSendWaitMS       int64    `json:"post_send_wait_ms,omitempty"`
 	TimeoutMS            int64    `json:"timeout_ms,omitempty"`
+	DeadlineUnixMS       int64    `json:"deadline_unix_ms,omitempty"`
 }
 
 type sendDelegateResponse struct {
@@ -95,7 +97,9 @@ func delegateSend(ctx context.Context, flags *rootFlags, req sendDelegateRequest
 	}
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(commandTimeout(flags)))
+	deadline := time.Now().Add(commandTimeout(flags))
+	req.DeadlineUnixMS = deadline.UnixMilli()
+	_ = conn.SetDeadline(deadline)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return sendDelegateResponse{}, err
 	}
@@ -123,7 +127,7 @@ func tryDelegateSend(ctx context.Context, flags *rootFlags, lockErr error, req s
 	return resp, true, nil
 }
 
-func startSendDelegateServer(ctx context.Context, a *app.App) (func(), error) {
+func startSendDelegateServer(ctx context.Context, a *app.App, spacing sendSpacing) (func(), error) {
 	path := sendDelegateSocketPath(a.StoreDir())
 	if err := removeStaleSendDelegateSocket(path); err != nil {
 		return nil, err
@@ -140,6 +144,15 @@ func startSendDelegateServer(ctx context.Context, a *app.App) (func(), error) {
 
 	done := make(chan struct{})
 	var sendMu sync.Mutex
+	var pacedSendSlot chan struct{}
+	if spacing.enabled() {
+		pacedSendSlot = make(chan struct{}, 1)
+		pacedSendSlot <- struct{}{}
+	}
+	// One pacer shared across connections: it spaces the serialized delegated
+	// sends so a burst of `wacli send` processes delegating to this daemon
+	// leaves the wire paced instead of back-to-back. Disabled = no-op.
+	pacer := newSendPacer(spacing)
 	go func() {
 		defer close(done)
 		for {
@@ -147,7 +160,7 @@ func startSendDelegateServer(ctx context.Context, a *app.App) (func(), error) {
 			if err != nil {
 				return
 			}
-			go handleSendDelegateConn(ctx, conn, a, &sendMu)
+			go handleSendDelegateConn(ctx, conn, a, &sendMu, pacedSendSlot, pacer)
 		}
 	}()
 
@@ -173,7 +186,7 @@ func removeStaleSendDelegateSocket(path string) error {
 	return os.Remove(path)
 }
 
-func handleSendDelegateConn(ctx context.Context, conn net.Conn, a *app.App, sendMu *sync.Mutex) {
+func handleSendDelegateConn(ctx context.Context, conn net.Conn, a *app.App, sendMu *sync.Mutex, pacedSendSlot chan struct{}, pacer *sendPacer) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
@@ -182,10 +195,65 @@ func handleSendDelegateConn(ctx context.Context, conn net.Conn, a *app.App, send
 		_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: err.Error()})
 		return
 	}
-	sendMu.Lock()
-	defer sendMu.Unlock()
+	requestCtx := ctx
+	if pacer.enabled() {
+		deadline := time.Now().Add(millisDuration(req.TimeoutMS, 5*time.Minute))
+		if req.DeadlineUnixMS > 0 {
+			callerDeadline := time.UnixMilli(req.DeadlineUnixMS)
+			if callerDeadline.Before(deadline) {
+				deadline = callerDeadline
+			}
+		}
+		var cancel context.CancelFunc
+		requestCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+		if requestDeadline, ok := requestCtx.Deadline(); ok {
+			// The fixed initial deadline only protects request decoding. A paced
+			// request may intentionally run longer than five minutes, so keep the
+			// transport alive through its budget and the final response write.
+			_ = conn.SetDeadline(requestDeadline.Add(sendDelegateResponseGrace))
+		}
+	}
 
-	resp, err := executeDelegatedSend(ctx, a, req)
+	if pacer.enabled() {
+		select {
+		case <-requestCtx.Done():
+			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{
+				OK:    false,
+				Error: "send spacing exceeded request timeout before dispatch",
+			})
+			return
+		case <-pacedSendSlot:
+			defer func() { pacedSendSlot <- struct{}{} }()
+		}
+	} else {
+		// Preserve the original unpaced serialization path exactly when the
+		// opt-in flag is unset.
+		sendMu.Lock()
+		defer sendMu.Unlock()
+	}
+
+	// Space this send from the previous one while serialized. Bound the wait by
+	// the caller's request timeout, including time spent waiting for earlier
+	// delegated sends, and have pacing + send share that one deadline. Disabled
+	// spacing leaves the path untouched.
+	if pacer.enabled() {
+		if !pacer.wait(requestCtx) {
+			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{
+				OK:    false,
+				Error: "send spacing exceeded request timeout before dispatch",
+			})
+			return
+		}
+	}
+
+	resp, err := executeDelegatedSend(requestCtx, a, req)
+	if pacer.enabled() {
+		// Record completion, not handler entry: recipient resolution, media
+		// preparation, and the actual wire send all happen inside execute.
+		// Starting the gap here prevents a slow operation from consuming it.
+		pacer.record()
+	}
 	if err != nil {
 		resp = sendDelegateResponse{OK: false, Error: err.Error()}
 	}
