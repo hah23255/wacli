@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Messages: extract comment bodies and album summaries in live/history sync, preserving comment reply targets and matching quote metadata. (#383 - thanks @shishiv and @Entretoize)
+
 - CLI: keep successful JSON commands successful when a pipe reader closes early, including Unix stdout SIGPIPE and Windows closed-pipe errors. (#366 - thanks @SebTardif)
 - Groups: warn on stderr when `groups list` truncates matching results, including JSON output, and keep `--events` warnings machine-readable. (#360 - thanks @hchittanuru3)
 - Sync: update whatsmeow so incoming socket frames use the active connection context.
